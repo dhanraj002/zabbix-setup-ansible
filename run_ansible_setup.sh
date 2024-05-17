@@ -1,29 +1,156 @@
-#!/bin/bash
+---
+- name: Setup Zabbix server and agent
+  hosts: localhost
+  become: yes
+  vars:
+    zabbix_db_user: zabbix
+    zabbix_db_password: your_password_here
 
-# Define variables
-ZABBIX_DB_USER=zabbix
-ZABBIX_DB_PASSWORD=your_password_here
+  tasks:
+    - name: Install EPEL repository for RHEL 9
+      command: dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
 
-# Ensure pip is installed
-if ! command -v pip &> /dev/null
-then
-    echo "pip not found, installing..."
-    sudo yum install -y python3-pip
-else
-    echo "pip is already installed"
-fi
+    - name: Ensure EPEL repository file exists
+      stat:
+        path: /etc/yum.repos.d/epel.repo
+      register: epel_repo
 
-# Install Ansible using pip if not already installed
-if ! command -v ansible &> /dev/null
-then
-    echo "Ansible not found, installing..."
-    sudo pip install ansible
-else
-    echo "Ansible is already installed"
-fi
+    - name: Disable Zabbix packages provided by EPEL
+      blockinfile:
+        path: /etc/yum.repos.d/epel.repo
+        block: |
+          [epel]
+          excludepkgs=zabbix*
+      when: epel_repo.stat.exists
+      notify: Clean all yum cache
 
-# Add /usr/local/bin to PATH
-export PATH=$PATH:/usr/local/bin
+    - name: Check if Zabbix release package is installed
+      command: rpm -q zabbix-release
+      register: zabbix_release_check
+      ignore_errors: true
 
-# Run the Ansible playbook
-ansible-playbook -i hosts.ini setup_zabbix.yml --extra-vars "zabbix_db_user=${ZABBIX_DB_USER} zabbix_db_password=${ZABBIX_DB_PASSWORD}"
+    - name: Add Zabbix repository
+      command: rpm -Uvh https://repo.zabbix.com/zabbix/6.0/rhel/9/x86_64/zabbix-release-6.0-4.el9.noarch.rpm
+      when: zabbix_release_check.rc != 0
+      notify: Clean all yum cache
+
+    - name: Clean all yum cache
+      command: dnf clean all
+      when: false
+
+    - name: Install Zabbix server, frontend, agent, and dependencies
+      yum:
+        name:
+          - zabbix-server-mysql
+          - zabbix-web-mysql
+          - zabbix-apache-conf
+          - zabbix-sql-scripts
+          - zabbix-selinux-policy
+          - zabbix-agent
+          - mariadb-server
+          - python3-PyMySQL
+        state: present
+
+    - name: Start and enable MariaDB
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - mariadb
+        - mysqld
+      ignore_errors: true
+
+    - name: Check if Zabbix database exists
+      command: sudo mysql -e "SHOW DATABASES LIKE 'zabbix';"
+      register: zabbix_db_check
+      ignore_errors: true
+
+    - name: Create Zabbix database
+      command: sudo mysql -e "CREATE DATABASE zabbix CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;"
+      when: "'zabbix' not in zabbix_db_check.stdout"
+
+    - name: Check if Zabbix user exists
+      command: sudo mysql -e "SELECT user FROM mysql.user WHERE user = '{{ zabbix_db_user }}';"
+      register: zabbix_user_check
+      ignore_errors: true
+
+    - name: Create Zabbix database user
+      command: sudo mysql -e "CREATE USER '{{ zabbix_db_user }}'@'localhost' IDENTIFIED BY '{{ zabbix_db_password }}'; GRANT ALL PRIVILEGES ON zabbix.* TO '{{ zabbix_db_user }}'@'localhost';"
+      when: "'{{ zabbix_db_user }}' not in zabbix_user_check.stdout"
+
+    - name: Set global log_bin_trust_function_creators
+      command: sudo mysql -e "SET GLOBAL log_bin_trust_function_creators = 1;"
+
+    - name: Check if Zabbix schema is already imported
+      command: sudo mysql -u{{ zabbix_db_user }} -p{{ zabbix_db_password }} -e "USE zabbix; SHOW TABLES LIKE 'role';"
+      register: zabbix_schema_check
+      ignore_errors: true
+
+    - name: Import initial Zabbix schema and data
+      shell: sudo zcat /usr/share/zabbix-sql-scripts/mysql/server.sql.gz | mysql --default-character-set=utf8mb4 -u{{ zabbix_db_user }} -p{{ zabbix_db_password }} zabbix
+      when: "'role' not in zabbix_schema_check.stdout"
+
+    - name: Disable log_bin_trust_function_creators
+      command: sudo mysql -e "SET GLOBAL log_bin_trust_function_creators = 0;"
+
+    - name: Configure Zabbix server database password
+      lineinfile:
+        path: /etc/zabbix/zabbix_server.conf
+        regexp: '^# DBPassword='
+        line: 'DBPassword={{ zabbix_db_password }}'
+
+    - name: Ensure PHP timezone is configured
+      lineinfile:
+        path: /etc/php.ini
+        regexp: '^;?date.timezone ='
+        line: 'date.timezone = UTC'
+
+    - name: Restart and enable Zabbix server, agent, httpd, and php-fpm
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+      loop:
+        - zabbix-server
+        - zabbix-agent
+        - httpd
+        - php-fpm
+      register: restart_services
+      ignore_errors: true
+
+    - name: Create Python script for checking disk space
+      copy:
+        dest: /usr/local/bin/check_disk_space.py
+        content: |
+          #!/usr/bin/env python3
+
+          import shutil
+
+          def check_disk_space():
+              threshold = 20
+              usage = shutil.disk_usage("/")
+              total, used, free = usage.total, usage.used, usage.free
+              free_percent = (free / total) * 100
+              if free_percent < threshold:
+                  return 1
+              return 0
+
+          if __name__ == "__main__":
+              result = check_disk_space()
+              print(result)
+        mode: '0755'
+
+    - name: Configure Zabbix agent user parameter
+      lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        line: 'UserParameter=check_disk_space,/usr/local/bin/check_disk_space.py'
+
+    - name: Restart Zabbix agent
+      systemd:
+        name: zabbix-agent
+        state: restarted
+
+  handlers:
+    - name: Clean all yum cache
+      command: dnf clean all
