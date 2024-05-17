@@ -77,7 +77,7 @@
 
     - name: Create Zabbix database user
       command: sudo mysql -e "CREATE USER '{{ zabbix_db_user }}'@'localhost' IDENTIFIED BY '{{ zabbix_db_password }}'; GRANT ALL PRIVILEGES ON zabbix.* TO '{{ zabbix_db_user }}'@'localhost';"
-      when: "'{{ zabbix_db_user }}' not in zabbix_user_check.stdout"
+      when: zabbix_db_user not in zabbix_user_check.stdout
 
     - name: Set global log_bin_trust_function_creators
       command: sudo mysql -e "SET GLOBAL log_bin_trust_function_creators = 1;"
@@ -106,13 +106,6 @@
         regexp: '^;?date.timezone ='
         line: 'date.timezone = UTC'
 
-    - name: Remove php_value directives from Zabbix Apache config
-      replace:
-        path: /etc/httpd/conf.d/zabbix.conf
-        regexp: '^.*php_value.*$'
-        replace: ''
-        backup: yes
-
     - name: Restart and enable Zabbix server, agent, httpd, and php-fpm
       systemd:
         name: "{{ item }}"
@@ -125,26 +118,6 @@
         - php-fpm
       register: restart_services
       ignore_errors: true
-
-    - name: Debug httpd service status
-      command: sudo systemctl status httpd
-      when: restart_services.results[2].failed
-      register: httpd_status
-
-    - name: Debug httpd service journal logs
-      command: sudo journalctl -xeu httpd
-      when: restart_services.results[2].failed
-      register: httpd_logs
-
-    - name: Display httpd service status
-      debug:
-        var: httpd_status.stdout_lines
-      when: httpd_status is defined
-
-    - name: Display httpd service logs
-      debug:
-        var: httpd_logs.stdout_lines
-      when: httpd_logs is defined
 
     - name: Create Python script for checking disk space
       copy:
@@ -177,28 +150,6 @@
       systemd:
         name: zabbix-agent
         state: restarted
-
-    - name: Create shell script for checking disk space
-      copy:
-        dest: /usr/local/bin/check_disk_space.sh
-        content: |
-          #!/bin/bash
-
-          # Check if any mounted filesystem has less than 20% free space
-          check_disk_space() {
-            threshold=20
-            df -H | awk 'NR>1 {print $5 " " $1}' | while read output;
-            do
-              usep=$(echo $output | awk '{print $1}' | sed 's/%//')
-              partition=$(echo $output | awk '{print $2}')
-              if [ $usep -gt $((100 - threshold)) ]; then
-                echo "Warning: The partition \"$partition\" has used $usep% of disk space."
-              fi
-            done
-          }
-
-          check_disk_space
-        mode: '0755'
 
   handlers:
     - name: Clean all yum cache
